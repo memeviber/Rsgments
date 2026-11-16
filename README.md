@@ -113,6 +113,62 @@ Compared with original Pygments, these averages represent approximately:
 the benchmark machine and workload; run `python bench.py` to measure your own
 environment.
 
+## Rsgments vs. rustgments
+
+[Rsgments](https://github.com/memeviber/rsgments) and [rustgments](https://pypi.org/project/rustgments/) are independent projects that use Rust to accelerate Pygments. Despite their similar names and goals, they take fundamentally different approaches.
+
+**Note:** `rustgments` is an independently developed third-party package published on PyPI. It is not an official Pygments package or an implementation maintained by the Pygments project.
+
+### Architectural differences
+
+| Aspect | Rsgments | rustgments |
+|---|---|---|
+| Lexer table handling | Compiles live Pygments lexer definitions at runtime | Generates and packages processed lexer tables at build time |
+| Lexer discovery | Uses the installed lexer's actual `_tokens` definitions | Uses a predefined set of generated lexer tables |
+| Custom lexers | Can potentially support dynamically registered `RegexLexer` classes | Generally falls back to Pygments for unsupported or unbundled lexers |
+| Pygments version handling | Designed around runtime compilation rather than a single generated table set | Generated tables are tied to a specific Pygments release |
+| Runtime compilation | Compiles lexer rules when needed and caches the result | Avoids compiling Pygments lexer tables at runtime |
+| Low-level output | Provides character-span and UTF-8 byte-span APIs | Primarily focuses on Pygments-compatible tokenization and highlighting |
+| Main design priority | Runtime flexibility and editor integration | Reproducibility, verified coverage, and predictable compatibility |
+
+### Why Rsgments takes a runtime approach
+
+Rsgments compiles the lexer definitions that are actually present in the running Python environment. Instead of shipping a fixed snapshot of processed Pygments lexer tables, it reads the live `_tokens` definitions and translates supported rules into native Rust execution.
+
+This approach has several potential advantages:
+
+- **Runtime flexibility:** New or dynamically registered `RegexLexer` implementations can potentially be compiled without regenerating and shipping a new set of lexer tables.
+- **Less dependence on generated snapshots:** Rsgments does not need to package a separate pre-generated table set for every supported Pygments release.
+- **Better integration with custom environments:** Applications that register their own lexers can benefit from the same runtime compilation mechanism, provided their lexer rules are supported.
+- **Editor-oriented APIs:** Rsgments exposes flat span buffers, including UTF-8 byte offsets. This is particularly useful for editors and syntax-highlighting integrations that need to map tokens directly to document positions.
+- **Incremental processing potential:** The byte-span API accepts a stack and byte range, allowing callers to continue lexing from a previous state and process bounded regions of source text.
+
+### Why rustgments takes a build-time approach
+
+rustgments uses a different trade-off. It processes Pygments lexer definitions during its build process and ships the resulting tables with the package.
+
+This has practical benefits:
+
+- Lexer tables are already processed before runtime.
+- The project can test each bundled lexer against Pygments and only enable native execution when its parity checks pass.
+- It avoids the need to implement general runtime translation of Pygments lexer definitions.
+- Its supported native lexer set and compatibility conditions are explicitly documented.
+
+The trade-off is that its generated tables are tied to particular Pygments and Python Unicode versions. New lexer definitions or changes to Pygments may require regenerating the tables and publishing an updated release.
+
+### Different priorities, not interchangeable implementations
+
+Neither architecture is universally better.
+
+- **Rsgments** prioritizes runtime compilation, flexibility, and low-level interfaces suitable for editor integrations.
+- **rustgments** prioritizes a predefined, extensively verified set of native lexers and reproducible behavior for supported configurations.
+
+Rsgments' runtime approach is particularly useful when an application needs to work with live Pygments lexer definitions, custom lexer registrations, or byte-oriented source-processing workflows.
+
+Actual compatibility still depends on the lexer constructs supported by Rsgments. Unsupported patterns and callbacks must use the appropriate fallback path, and compatibility should be established through parity tests rather than assumed.
+
+The two projects share a similar goal, but their architectures solve different engineering problems.
+
 ## License
 
 Rsgments is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
