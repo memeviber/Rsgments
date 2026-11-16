@@ -61,11 +61,19 @@ def main():
     t_flat = time.perf_counter() - t0
 
     assert len(orig_tokens) == len(rs_tokens) == len(raw_spans) == (len(flat_buf) // 12)
-    print(f"--- Benchmark (~{code.count(chr(10))} lines, {len(orig_tokens)} tokens) ---")
+    print(
+        f"--- Benchmark (~{code.count(chr(10))} lines, {len(orig_tokens)} tokens) ---"
+    )
     print(f"Original Pygments           : {t_orig * 1000:7.2f} ms (1.0x)")
-    print(f"Rsgments (get_tokens)      : {t_rs * 1000:7.2f} ms ({t_orig / t_rs:.1f}x faster)")
-    print(f"Rsgments (lex_raw_spans)   : {t_span * 1000:7.2f} ms ({t_orig / t_span:.1f}x faster)")
-    print(f"Rsgments (lex_flat_spans)  : {t_flat * 1000:7.2f} ms ({t_orig / t_flat:.1f}x faster)")
+    print(
+        f"Rsgments (get_tokens)      : {t_rs * 1000:7.2f} ms ({t_orig / t_rs:.1f}x faster)"
+    )
+    print(
+        f"Rsgments (lex_raw_spans)   : {t_span * 1000:7.2f} ms ({t_orig / t_span:.1f}x faster)"
+    )
+    print(
+        f"Rsgments (lex_flat_spans)  : {t_flat * 1000:7.2f} ms ({t_orig / t_flat:.1f}x faster)"
+    )
 
 
 if __name__ == "__main__":

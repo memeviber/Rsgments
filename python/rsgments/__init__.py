@@ -48,8 +48,12 @@ _patched = False
 _draining = False
 _in_flight = 0
 
-_class_cache: weakref.WeakKeyDictionary[type, CompiledLexer] = weakref.WeakKeyDictionary()
-_instance_cache: weakref.WeakKeyDictionary[object, CompiledLexer] = weakref.WeakKeyDictionary()
+_class_cache: weakref.WeakKeyDictionary[type, CompiledLexer] = (
+    weakref.WeakKeyDictionary()
+)
+_instance_cache: weakref.WeakKeyDictionary[object, CompiledLexer] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def is_supported(lexer: object) -> bool:
@@ -107,9 +111,7 @@ def _extract_bygroups_args(action) -> Optional[tuple]:
     return args
 
 
-def _compile_state_ops(
-    new_state, state_to_id: dict[str, int]
-) -> list[tuple[str, int]]:
+def _compile_state_ops(new_state, state_to_id: dict[str, int]) -> list[tuple[str, int]]:
     if new_state is None:
         return []
     ops: list[tuple[str, int]] = []
@@ -180,7 +182,9 @@ def _build_compiled_lexer(lexer: RegexLexer) -> CompiledLexer:
                 locale_flag = bool(flags & re.LOCALE)
             else:
                 pattern = None
-                ignore_case = multi_line = dot_all = verbose = ascii_flag = locale_flag = False
+                ignore_case = multi_line = dot_all = verbose = ascii_flag = (
+                    locale_flag
+                ) = False
 
             ops = _compile_state_ops(new_state, state_to_id)
 
@@ -390,9 +394,7 @@ def lex_flat_byte_spans(
     `(byte_start, byte_length, token_id)`.
     """
     compiled = compile_lexer(lexer)
-    return compiled.lex_flat_byte_spans(
-        text, lexer, list(stack), start_byte, end_byte
-    )
+    return compiled.lex_flat_byte_spans(text, lexer, list(stack), start_byte, end_byte)
 
 
 def patch_pygments() -> None:

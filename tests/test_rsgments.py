@@ -47,16 +47,28 @@ def f(x: int = 0) -> str:
     [
         (PythonLexer(), PYTHON_EDGE_CASES),
         (RustLexer(), 'fn main() { let s = r#"chào Rust 🦀"#; println!("{s}"); }\n'),
-        (CppLexer(), '#include <vector>\n// A comment\nint main() { return 0; }\n'),
+        (CppLexer(), "#include <vector>\n// A comment\nint main() { return 0; }\n"),
         (JavascriptLexer(), 'const fn = (a, b = "việt") => `res: ${a + b}`;\n'),
-        (TypeScriptLexer(), 'interface User { id: number; name: string; }\nconst u: User = { id: 1, name: "A" };\n'),
-        (HtmlLexer(), '<html><style>body{color:#fff}</style><script>let x="hi";</script></html>\n'),
-        (CssLexer(), '.btn { color: #ff00aa; margin: 10px 20px; }\n'),
+        (
+            TypeScriptLexer(),
+            'interface User { id: number; name: string; }\nconst u: User = { id: 1, name: "A" };\n',
+        ),
+        (
+            HtmlLexer(),
+            '<html><style>body{color:#fff}</style><script>let x="hi";</script></html>\n',
+        ),
+        (CssLexer(), ".btn { color: #ff00aa; margin: 10px 20px; }\n"),
         (JsonLexer(), '{"tiếng_việt": [1, 2.5, true, null, "🎉"]}\n'),
         (MarkdownLexer(), '# Tiêu đề\n\n```python\ndef hi(): return "ok"\n```\n'),
-        (SqlLexer(), "SELECT id, name FROM users WHERE name LIKE '%Việt%' AND active = 1;\n"),
+        (
+            SqlLexer(),
+            "SELECT id, name FROM users WHERE name LIKE '%Việt%' AND active = 1;\n",
+        ),
         (BashLexer(), '#!/bin/bash\nfor f in *.py; do echo "File: $f"; done\n'),
-        (GoLexer(), 'package main\nimport "fmt"\nfunc main() { fmt.Println("Xin chào") }\n'),
+        (
+            GoLexer(),
+            'package main\nimport "fmt"\nfunc main() { fmt.Println("Xin chào") }\n',
+        ),
     ],
 )
 def test_parity_with_pygments(lexer, code):
@@ -158,14 +170,20 @@ def test_stateful_line_by_line_highlighting():
         'x = """start multiline',
         'still inside string "quote" def fake():',
         'end""" + 123',
-        'def real_fn(): pass',
+        "def real_fn(): pass",
     ]
     stack = ("root",)
     all_line_tokens = []
     for line in lines:
-        buf, table, final_stack = rsgments.lex_flat_spans(lexer, line + "\n", stack=stack)
+        buf, table, final_stack = rsgments.lex_flat_spans(
+            lexer, line + "\n", stack=stack
+        )
         mv = memoryview(buf).cast("I")
-        tokens = [(mv[i], mv[i + 1], table[mv[i + 2]]) for i in range(0, len(mv), 3) if mv[i] < len(line)]
+        tokens = [
+            (mv[i], mv[i + 1], table[mv[i + 2]])
+            for i in range(0, len(mv), 3)
+            if mv[i] < len(line)
+        ]
         all_line_tokens.append(tokens)
         stack = tuple(final_stack)
 
@@ -205,18 +223,14 @@ def test_flat_byte_spans_clip_unicode_ranges():
 
     full_buf, table, full_stack = rsgments.lex_flat_byte_spans(lexer, text)
     full_values = memoryview(full_buf).cast("I")
-    full_spans = [
-        tuple(full_values[i : i + 3])
-        for i in range(0, len(full_values), 3)
-    ]
+    full_spans = [tuple(full_values[i : i + 3]) for i in range(0, len(full_values), 3)]
 
     range_buf, range_table, range_stack = rsgments.lex_flat_byte_spans(
         lexer, text, start_byte=start_byte, end_byte=end_byte
     )
     range_values = memoryview(range_buf).cast("I")
     range_spans = [
-        tuple(range_values[i : i + 3])
-        for i in range(0, len(range_values), 3)
+        tuple(range_values[i : i + 3]) for i in range(0, len(range_values), 3)
     ]
     expected = []
     for token_start, token_length, token_id in full_spans:
@@ -298,7 +312,9 @@ def test_multithreaded_patch_unpatch_consistency():
     py_lexer = PythonLexer()
     html_lexer = HtmlLexer()
     py_code = PYTHON_EDGE_CASES * 25
-    html_code = "<html><style>body{color:#fff}</style><script>const x=1;</script></html>\n" * 25
+    html_code = (
+        "<html><style>body{color:#fff}</style><script>const x=1;</script></html>\n" * 25
+    )
 
     with rsgments.unpatched():
         expected_py = list(py_lexer.get_tokens_unprocessed(py_code))
