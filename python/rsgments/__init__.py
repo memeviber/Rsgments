@@ -29,7 +29,7 @@ __all__ = [
     "CompiledLexer",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
