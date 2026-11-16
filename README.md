@@ -90,6 +90,29 @@ python -m pytest -v
 python bench.py
 ```
 
+### Benchmark comparison
+
+The following results are the trimmed means of 14 benchmark runs. The fastest
+and slowest runs were discarded, and the remaining 12 runs were averaged.
+Each run processed approximately 5,995 lines and 81,750 tokens.
+
+| Implementation | Average time | Speedup |
+|---|---:|---:|
+| Original Pygments | 570.58 ms | 1.00× |
+| Rsgments (`get_tokens`) | 74.95 ms | 7.61× |
+| Rsgments (`lex_raw_spans`) | 55.95 ms | 10.20× |
+| Rsgments (`lex_flat_spans`) | 49.80 ms | 11.46× |
+
+Compared with original Pygments, these averages represent approximately:
+
+- `get_tokens`: 86.9% less processing time
+- `lex_raw_spans`: 90.2% less processing time
+- `lex_flat_spans`: 91.3% less processing time
+
+`lex_flat_spans` averaged 49.80 ms for this workload. Results are specific to
+the benchmark machine and workload; run `python bench.py` to measure your own
+environment.
+
 ## License
 
 Rsgments is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
