@@ -1,0 +1,585 @@
+name: Build & Release Wheels
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # 1. Gate: only trigger builds on commits containing `build [version]`
+  # ============================================================================
+  gate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, 'build ')
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.parse.outputs.should_build }}
+      version: ${{ steps.parse.outputs.version }}
+      tag: ${{ steps.parse.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse build version
+        id: parse
+        shell: python3 {0}
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          import os
+          import re
+          import tomllib
+
+          event = os.environ["GITHUB_EVENT_NAME"]
+          if event == "workflow_dispatch":
+              raw = os.environ.get("INPUT_VERSION", "").strip()
+          else:
+              msg = os.environ.get("COMMIT_MSG", "")
+              m = re.search(
+                  r"\bbuild\s+\[?(v?[0-9]+(?:\.[0-9]+)+(?:[.-][0-9A-Za-z]+)*)\]?",
+                  msg,
+                  re.IGNORECASE,
+              )
+              raw = m.group(1) if m else ""
+
+          out_path = os.environ["GITHUB_OUTPUT"]
+          if not raw:
+              print("No 'build [version]' marker found. Skipping build.")
+              with open(out_path, "a", encoding="utf-8") as f:
+                  f.write("should_build=false\n")
+              raise SystemExit(0)
+
+          clean_ver = raw.lstrip("vV")
+          tag = f"v{clean_ver}"
+
+          with open("pyproject.toml", "rb") as f:
+              pkg_ver = tomllib.load(f)["project"]["version"]
+          if pkg_ver != clean_ver:
+              print(
+                  f"::warning::Commit version ({clean_ver}) differs from pyproject.toml ({pkg_ver}). "
+                  "PyPI will use the version specified in pyproject.toml."
+              )
+
+          print(f"Triggering build for version={clean_ver}, tag={tag}")
+          with open(out_path, "a", encoding="utf-8") as f:
+              f.write("should_build=true\n")
+              f.write(f"version={clean_ver}\n")
+              f.write(f"tag={tag}\n")
+
+  # ============================================================================
+  # 2. Source distribution (sdist)
+  # ============================================================================
+  sdist:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # ============================================================================
+  # 3. Linux (manylinux glibc: x86_64, x86, aarch64, armv7, s390x, ppc64le)
+  # ============================================================================
+  linux:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+            native_test: true
+          - runner: ubuntu-24.04
+            target: x86
+            native_test: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+            native_test: true
+          - runner: ubuntu-24.04
+            target: armv7
+            native_test: false
+          - runner: ubuntu-24.04
+            target: s390x
+            native_test: false
+          - runner: ubuntu-24.04
+            target: ppc64le
+            native_test: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build cp39 wheel (native)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.9
+          sccache: "true"
+          manylinux: auto
+
+      - name: Build cp310-abi3 wheel (3.10 - 3.14 GIL)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.10 --features pyo3/abi3-py310
+          sccache: "true"
+          manylinux: auto
+
+      - name: Build cp314t wheel (free-threaded)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.14t
+          sccache: "true"
+          manylinux: auto
+
+      - name: Build cp313t wheel (free-threaded, best-effort)
+        continue-on-error: true
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.13t
+          sccache: "true"
+          manylinux: auto
+
+      # Verify built wheels on native host architectures (3.9, 3.14 via abi3, and 3.14t)
+      - name: Setup Python 3.9
+        if: matrix.native_test
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - name: Test cp39 wheel
+        if: matrix.native_test
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-cp39-*.whl
+          pytest -v
+
+      - name: Setup Python 3.14
+        if: matrix.native_test
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Test cp310-abi3 wheel on Python 3.14
+        if: matrix.native_test
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-abi3-*.whl
+          pytest -v
+
+      - name: Setup Python 3.14t
+        if: matrix.native_test
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14t"
+      - name: Test cp314t wheel
+        if: matrix.native_test
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-cp314t-*.whl
+          pytest -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ============================================================================
+  # 4. Linux (musllinux_1_2: x86_64, x86, aarch64, armv7)
+  # ============================================================================
+  musllinux:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04
+            target: x86
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+          - runner: ubuntu-24.04
+            target: armv7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build cp39 wheel (native)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.9
+          sccache: "true"
+          manylinux: musllinux_1_2
+
+      - name: Build cp310-abi3 wheel (3.10 - 3.14 GIL)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.10 --features pyo3/abi3-py310
+          sccache: "true"
+          manylinux: musllinux_1_2
+
+      - name: Build cp314t wheel (free-threaded)
+        continue-on-error: ${{ matrix.target == 'armv7' }}
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.14t
+          sccache: "true"
+          manylinux: musllinux_1_2
+
+      - name: Build cp313t wheel (free-threaded, best-effort)
+        continue-on-error: true
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.13t
+          sccache: "true"
+          manylinux: musllinux_1_2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ============================================================================
+  # 5. macOS (Apple Silicon aarch64 & Intel x86_64)
+  # ============================================================================
+  macos:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64
+          - runner: macos-15-intel
+            target: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python 3.9 native
+      - name: Setup Python 3.9
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - name: Build cp39 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.9
+          sccache: "true"
+      - name: Test cp39 wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-cp39-*.whl
+          pytest -v
+
+      # Python 3.10 - 3.14 GIL (cp310-abi3)
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Build cp310-abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.10 --features pyo3/abi3-py310
+          sccache: "true"
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Test cp310-abi3 wheel on Python 3.14
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-abi3-*.whl
+          pytest -v
+
+      # Python 3.14t free-threaded
+      - name: Setup Python 3.14t
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14t"
+      - name: Build cp314t wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.14t
+          sccache: "true"
+      - name: Test cp314t wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/*-cp314t-*.whl
+          pytest -v
+
+      # Python 3.13t free-threaded (best-effort)
+      - name: Setup Python 3.13t
+        id: py313t
+        continue-on-error: true
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13t"
+      - name: Build cp313t wheel
+        if: steps.py313t.outcome == 'success'
+        continue-on-error: true
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.13t
+          sccache: "true"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ============================================================================
+  # 6. Windows (GIL: x64, x86, arm64)
+  # ============================================================================
+  windows:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x64
+            arch: x64
+            has_39: true
+            abi3_py: "3.10"
+            abi3_feat: "pyo3/abi3-py310"
+          - runner: windows-latest
+            target: x86
+            arch: x86
+            has_39: true
+            abi3_py: "3.10"
+            abi3_feat: "pyo3/abi3-py310"
+          - runner: windows-11-arm
+            target: aarch64
+            arch: arm64
+            has_39: false
+            abi3_py: "3.11"
+            abi3_feat: "pyo3/abi3-py311"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.9
+        if: matrix.has_39
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          architecture: ${{ matrix.arch }}
+      - name: Build cp39 wheel
+        if: matrix.has_39
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i 3.9
+          sccache: "true"
+      - name: Test cp39 wheel
+        if: matrix.has_39
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          $whl = Get-ChildItem dist\*-cp39-*.whl | Select-Object -First 1
+          python -m pip install pytest $whl.FullName
+          pytest -v
+
+      - name: Setup Python ${{ matrix.abi3_py }} for abi3
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.abi3_py }}
+          architecture: ${{ matrix.arch }}
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i ${{ matrix.abi3_py }} --features ${{ matrix.abi3_feat }}
+          sccache: "true"
+
+      - name: Setup Python 3.14 to verify abi3 wheel
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          architecture: ${{ matrix.arch }}
+      - name: Test abi3 wheel on Python 3.14
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          $whl = Get-ChildItem dist\*-abi3-*.whl | Select-Object -First 1
+          python -m pip install pytest $whl.FullName
+          pytest -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ============================================================================
+  # 7. Windows Free-threaded (isolated jobs to avoid CPython installer collision)
+  # ============================================================================
+  windows_freethreaded:
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.allow_fail }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x64
+            arch: x64
+            py: "3.14t"
+            allow_fail: false
+          - runner: windows-latest
+            target: x64
+            arch: x64
+            py: "3.13t"
+            allow_fail: true
+          - runner: windows-latest
+            target: x86
+            arch: x86
+            py: "3.14t"
+            allow_fail: true
+          - runner: windows-11-arm
+            target: aarch64
+            arch: arm64
+            py: "3.14t"
+            allow_fail: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.py }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.py }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Build ${{ matrix.py }} wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i ${{ matrix.py }}
+          sccache: "true"
+
+      - name: Test ${{ matrix.py }} wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          $whl = Get-ChildItem dist\*.whl | Select-Object -First 1
+          python -m pip install pytest $whl.FullName
+          pytest -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}-${{ matrix.py }}
+          path: dist/*.whl
+          if-no-files-found: warn
+
+  # ============================================================================
+  # 8. Consolidate artifacts, check metadata with twine, and create GitHub Release
+  # ============================================================================
+  release:
+    needs: [gate, sdist, linux, musllinux, macos, windows, windows_freethreaded]
+    if: >-
+      always() &&
+      needs.gate.outputs.should_build == 'true' &&
+      needs.sdist.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.musllinux.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.windows.result == 'success' &&
+      needs.windows_freethreaded.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Verify package metadata with twine
+        run: |
+          ls -lh dist/
+          python3 -m pip install --upgrade twine
+          twine check dist/*
+
+      - name: Upload consolidated dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.gate.outputs.tag }}
+          name: Release ${{ needs.gate.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  # ============================================================================
+  # 9. Publish to PyPI (opt-in via repository variable ENABLE_PYPI=true)
+  # ============================================================================
+  pypi_publish:
+    needs: [gate, release]
+    if: >-
+      needs.gate.outputs.should_build == 'true' &&
+      vars.ENABLE_PYPI == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rsgments
+
+    steps:
+      - name: Retrieve release distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dists
+          path: dist/
+
+      - name: Publish release distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
