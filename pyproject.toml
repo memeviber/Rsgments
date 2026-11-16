@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rsgments"
+version = "0.2.0"
+description = "Rust-accelerated state machine engine for Pygments"
+requires-python = ">=3.9"
+dependencies = ["pygments>=2.14"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "rsgments._rsgments"

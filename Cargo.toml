@@ -1,0 +1,13 @@
+[package]
+name = "rsgments"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "_rsgments"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.28"
+regex-automata = "0.4"
+fancy-regex = "0.20"
