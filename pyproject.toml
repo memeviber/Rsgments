@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rsgments"
-version = "0.2.1"
+version = "0.3.0"
 description = "Rust-accelerated state machine engine for Pygments"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.9"

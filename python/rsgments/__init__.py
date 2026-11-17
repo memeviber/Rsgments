@@ -9,7 +9,7 @@ from typing import Iterable, Iterator, List, Optional, Tuple
 from pygments.lexer import ExtendedRegexLexer, RegexLexer
 from pygments.token import Error, Text, Whitespace, _TokenType
 
-from ._rsgments import CompiledLexer, CompiledLexerBuilder
+from ._rsgments import CompiledLexer, CompiledLexerBuilder, LexProfile
 
 __all__ = [
     "__version__",
@@ -26,10 +26,12 @@ __all__ = [
     "lex_raw_spans",
     "lex_flat_spans",
     "lex_flat_byte_spans",
+    "lex_flat_spans_profiled",
     "CompiledLexer",
+    "LexProfile",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
@@ -180,6 +182,12 @@ def _build_compiled_lexer(lexer: RegexLexer) -> CompiledLexer:
                 verbose = bool(flags & re.VERBOSE)
                 ascii_flag = bool(flags & re.ASCII)
                 locale_flag = bool(flags & re.LOCALE)
+                try:
+                    pattern.encode("utf-8")
+                except UnicodeEncodeError:
+                    # Python's `re` allows surrogates U+D800..U+DFFF in patterns,
+                    # but Rust `&str` requires valid UTF-8 -> fall back to PyOnly.
+                    pattern = None
             else:
                 pattern = None
                 ignore_case = multi_line = dot_all = verbose = ascii_flag = (
@@ -311,7 +319,9 @@ def _rs_get_tokens_unprocessed(self, text: str, stack=("root",)):
     depth = getattr(_tls, "depth", 0)
 
     with _patch_cond:
-        if depth == 0 and (not _patched or _draining):
+        # If the lexer is unsupported by Rsgments (e.g. it inherits from ExtendedRegexLexer)
+        # or is unpatched / draining -> fall back directly to vanilla Pygments.
+        if (depth == 0 and (not _patched or _draining)) or not is_supported(self):
             use_orig = True
         else:
             use_orig = False
@@ -321,10 +331,13 @@ def _rs_get_tokens_unprocessed(self, text: str, stack=("root",)):
     if use_orig:
         return _orig_get_tokens_unprocessed(self, text, stack)
 
+    fallback_orig = False
     try:
         compiled = compile_lexer(self)
         tokens = compiled.lex_py_tokens(text, self, list(stack))
         return iter(tokens)
+    except UnicodeEncodeError:
+        fallback_orig = True
     finally:
         with _patch_cond:
             _tls.depth = depth
@@ -332,6 +345,8 @@ def _rs_get_tokens_unprocessed(self, text: str, stack=("root",)):
             if _in_flight == 0:
                 _patch_cond.notify_all()
 
+    if fallback_orig:
+        return _orig_get_tokens_unprocessed(self, text, stack)
 
 def lex_tokens(
     lexer: RegexLexer,
@@ -395,6 +410,16 @@ def lex_flat_byte_spans(
     """
     compiled = compile_lexer(lexer)
     return compiled.lex_flat_byte_spans(text, lexer, list(stack), start_byte, end_byte)
+
+
+def lex_flat_spans_profiled(
+    lexer: RegexLexer,
+    text: str,
+    stack: Iterable[str] = ("root",),
+) -> Tuple[bytes, Tuple[_TokenType, ...], List[str], LexProfile]:
+    """Lex a text and return flat spans with profiling information."""
+    compiled = compile_lexer(lexer)
+    return compiled.lex_flat_spans_profiled(text, lexer, list(stack))
 
 
 def patch_pygments() -> None:

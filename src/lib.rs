@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use fancy_regex::{Regex as FancyRegex, RegexBuilder as FancyBuilder};
 use pyo3::prelude::*;
@@ -67,10 +68,10 @@ struct MultiDfaEntry {
     meta: RaRegex,
     pat_to_rule: Vec<usize>,
 }
-
 struct CompiledState {
     rules: Vec<CompiledRule>,
     unindexed_rules: Vec<usize>,
+    first_dfa_rule_idx: usize,
     dfas: Vec<MultiDfaEntry>,
 }
 
@@ -79,6 +80,7 @@ impl CompiledState {
         Self {
             rules: Vec::new(),
             unindexed_rules: Vec::new(),
+            first_dfa_rule_idx: 0,
             dfas: Vec::new(),
         }
     }
@@ -86,6 +88,11 @@ impl CompiledState {
     fn finalize(&mut self) {
         self.unindexed_rules.clear();
         self.dfas.clear();
+        self.first_dfa_rule_idx = self
+            .rules
+            .iter()
+            .position(|r| r.dfa_pattern.is_some())
+            .unwrap_or(self.rules.len());
 
         let mut fancy_indices = Vec::new();
         for (idx, r) in self.rules.iter().enumerate() {
@@ -148,6 +155,64 @@ impl CompiledState {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct ProfileCounters {
+    tokens_emitted: u64,
+    dfa_searches: u64,
+    dfa_hybrid_hits: u64,
+    dfa_meta_fallbacks: u64,
+    fancy_verify_calls: u64,
+    superset_false_positives: u64,
+    py_regex_calls: u64,
+    py_regex_hits: u64,
+    py_callback_calls: u64,
+    fancy_ns: u64,
+    py_fallback_ns: u64,
+}
+
+#[pyclass(frozen)]
+pub struct LexProfile {
+    #[pyo3(get)]
+    pub tokens_emitted: u64,
+    #[pyo3(get)]
+    pub dfa_searches: u64,
+    #[pyo3(get)]
+    pub dfa_hybrid_hits: u64,
+    #[pyo3(get)]
+    pub dfa_meta_fallbacks: u64,
+    #[pyo3(get)]
+    pub fancy_verify_calls: u64,
+    #[pyo3(get)]
+    pub superset_false_positives: u64,
+    #[pyo3(get)]
+    pub py_regex_calls: u64,
+    #[pyo3(get)]
+    pub py_regex_hits: u64,
+    #[pyo3(get)]
+    pub py_callback_calls: u64,
+    #[pyo3(get)]
+    pub fancy_ns: u64,
+    #[pyo3(get)]
+    pub py_fallback_ns: u64,
+}
+
+impl From<ProfileCounters> for LexProfile {
+    fn from(c: ProfileCounters) -> Self {
+        Self {
+            tokens_emitted: c.tokens_emitted,
+            dfa_searches: c.dfa_searches,
+            dfa_hybrid_hits: c.dfa_hybrid_hits,
+            dfa_meta_fallbacks: c.dfa_meta_fallbacks,
+            fancy_verify_calls: c.fancy_verify_calls,
+            superset_false_positives: c.superset_false_positives,
+            py_regex_calls: c.py_regex_calls,
+            py_regex_hits: c.py_regex_hits,
+            py_callback_calls: c.py_callback_calls,
+            fancy_ns: c.fancy_ns,
+            py_fallback_ns: c.py_fallback_ns,
+        }
+    }
+}
 struct LexerScratch {
     hybrid_caches: Vec<Vec<Option<HybridCache>>>,
     meta_caches: Vec<Vec<Option<MetaCache>>>,
@@ -452,6 +517,268 @@ fn strip_lookarounds_to_superset(pat: &str, verbose: bool) -> Option<String> {
     Some(out)
 }
 
+/// Translate Python `re`-specific syntax conventions into `regex-syntax` / `fancy-regex` syntax:
+/// - Outside `[...]`: `\<` -> `<`, `\>` -> `>`, `\Z` -> `\z`
+/// - Inside `[...]`: `\b` -> `\x08`, `\<` -> `<`, `\>` -> `>`
+/// - Inside `[...]` when `(?x)` (`verbose`) is enabled: escape `#` as `\#` and escape whitespace
+///   (because Rust's `regex-syntax` handles comments and whitespace inside `[...]` as well, unlike Python's `re`).
+/// Returns `(translated_pattern, ends_with_verbose)`.
+fn transpile_python_regex(pat: &str, initial_verbose: bool) -> (String, bool) {
+    let bytes = pat.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 16);
+    let mut i = 0usize;
+    let mut in_class = false;
+    let mut class_start = false;
+    let mut x_stack: Vec<bool> = vec![initial_verbose];
+
+    while i < len {
+        let x_active = *x_stack.last().unwrap_or(&initial_verbose);
+        let b = bytes[i];
+
+        if b == b'\\' {
+            if i + 1 >= len {
+                out.push('\\');
+                break;
+            }
+            let next = bytes[i + 1];
+            if in_class {
+                class_start = false;
+                match next {
+                    b'b' => {
+                        out.push_str("\\x08");
+                        i += 2;
+                        continue;
+                    }
+                    b'<' => {
+                        out.push('<');
+                        i += 2;
+                        continue;
+                    }
+                    b'>' => {
+                        out.push('>');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else {
+                match next {
+                    b'<' => {
+                        out.push('<');
+                        i += 2;
+                        continue;
+                    }
+                    b'>' => {
+                        out.push('>');
+                        i += 2;
+                        continue;
+                    }
+                    b'Z' => {
+                        out.push_str("\\z");
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(ch) = pat[i + 1..].chars().next() else {
+                out.push('\\');
+                break;
+            };
+            out.push('\\');
+            out.push(ch);
+            i += 1 + ch.len_utf8();
+            continue;
+        }
+
+        if in_class {
+            if b == b'[' {
+                out.push('[');
+                i += 1;
+                class_start = false;
+                continue;
+            }
+            if b == b'^' && class_start {
+                out.push('^');
+                i += 1;
+                continue;
+            }
+            if b == b']' && !class_start {
+                in_class = false;
+                out.push(']');
+                i += 1;
+                continue;
+            }
+            class_start = false;
+
+            if x_active {
+                match b {
+                    b'#' => {
+                        out.push_str("\\#");
+                        i += 1;
+                        continue;
+                    }
+                    b' ' => {
+                        out.push_str("\\x20");
+                        i += 1;
+                        continue;
+                    }
+                    b'\t' => {
+                        out.push_str("\\t");
+                        i += 1;
+                        continue;
+                    }
+                    b'\n' => {
+                        out.push_str("\\n");
+                        i += 1;
+                        continue;
+                    }
+                    b'\r' => {
+                        out.push_str("\\r");
+                        i += 1;
+                        continue;
+                    }
+                    0x0B => {
+                        out.push_str("\\x0b");
+                        i += 1;
+                        continue;
+                    }
+                    0x0C => {
+                        out.push_str("\\f");
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(ch) = pat[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+            continue;
+        }
+
+        // Outside character classes (`[...]`)
+        if x_active && b == b'#' {
+            while i < len && bytes[i] != b'\n' {
+                if let Some(ch) = pat[i..].chars().next() {
+                    out.push(ch);
+                    i += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if b == b'[' {
+            in_class = true;
+            class_start = true;
+            out.push('[');
+            i += 1;
+            continue;
+        }
+
+        if b == b'(' {
+            if i + 1 < len && bytes[i + 1] == b'?' {
+                // Check (?#comment)
+                if i + 2 < len && bytes[i + 2] == b'#' {
+                    out.push_str("(?#");
+                    i += 3;
+                    while i < len {
+                        if bytes[i] == b'\\' && i + 1 < len {
+                            if let Some(ch) = pat[i + 1..].chars().next() {
+                                out.push('\\');
+                                out.push(ch);
+                                i += 1 + ch.len_utf8();
+                                continue;
+                            }
+                        }
+                        if bytes[i] == b')' {
+                            out.push(')');
+                            i += 1;
+                            break;
+                        }
+                        if let Some(ch) = pat[i..].chars().next() {
+                            out.push(ch);
+                            i += ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // Check (?flags) or (?flags:...)
+                let mut j = i + 2;
+                let mut next_x = x_active;
+                let mut neg = false;
+                let mut valid_flags = false;
+                while j < len {
+                    let fb = bytes[j];
+                    if fb == b'-' && !neg {
+                        neg = true;
+                        j += 1;
+                        continue;
+                    }
+                    if matches!(fb, b'a' | b'i' | b'L' | b'm' | b's' | b'u' | b'x') {
+                        valid_flags = true;
+                        if fb == b'x' {
+                            next_x = !neg;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if valid_flags && j < len && (bytes[j] == b')' || bytes[j] == b':') {
+                    if bytes[j] == b')' {
+                        if let Some(top) = x_stack.last_mut() {
+                            *top = next_x;
+                        }
+                        out.push_str(&pat[i..=j]);
+                        i = j + 1;
+                        continue;
+                    } else {
+                        x_stack.push(next_x);
+                        out.push_str(&pat[i..=j]);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            x_stack.push(x_active);
+            out.push('(');
+            i += 1;
+            continue;
+        }
+
+        if b == b')' {
+            if x_stack.len() > 1 {
+                x_stack.pop();
+            }
+            out.push(')');
+            i += 1;
+            continue;
+        }
+
+        if let Some(ch) = pat[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let ends_verbose = *x_stack.last().unwrap_or(&initial_verbose);
+    (out, ends_verbose)
+}
+
 fn compile_engine(
     pattern: &str,
     ignore_case: bool,
@@ -478,6 +805,9 @@ fn compile_engine(
         return (Engine::PyOnly, None, false);
     }
 
+    let (transpiled, ends_verbose) = transpile_python_regex(pattern, verbose);
+    let pat_str = transpiled.as_str();
+
     let syn_cfg = syntax::Config::new()
         .case_insensitive(ignore_case)
         .multi_line(multi_line)
@@ -485,8 +815,8 @@ fn compile_engine(
         .ignore_whitespace(verbose)
         .unicode(true);
 
-    if let Ok(re) = RaRegex::builder().syntax(syn_cfg).build(pattern) {
-        let wrapped = wrap_inline_flags(pattern, ignore_case, multi_line, dot_all, verbose);
+    if let Ok(re) = RaRegex::builder().syntax(syn_cfg).build(pat_str) {
+        let wrapped = wrap_inline_flags(pat_str, ignore_case, multi_line, dot_all, verbose);
         let dfa_pat = if RaRegex::new(&wrapped).is_ok() {
             Some(wrapped)
         } else {
@@ -495,10 +825,11 @@ fn compile_engine(
         return (Engine::Automata(re), dfa_pat, false);
     }
 
-    let anchored_pat = if verbose {
-        format!(r"\G(?:\n{}\n)", pattern)
+    // Note: Do not use a raw string `r"..."` so that `\n` becomes an actual newline for the trailing comment in `x` mode!
+    let anchored_pat = if verbose || ends_verbose {
+        format!("\\G(?:\n{pat_str}\n)")
     } else {
-        format!(r"\G(?:{})", pattern)
+        format!("\\G(?:{pat_str})")
     };
 
     let mut fb = FancyBuilder::new(&anchored_pat);
@@ -512,7 +843,7 @@ fn compile_engine(
     match fb.build() {
         Ok(re) => {
             let mut superset_pat = None;
-            if let Some(stripped) = strip_lookarounds_to_superset(pattern, verbose) {
+            if let Some(stripped) = strip_lookarounds_to_superset(pat_str, verbose) {
                 let wrapped =
                     wrap_inline_flags(&stripped, ignore_case, multi_line, dot_all, verbose);
                 if let Ok(sup_re) = RaRegex::new(&wrapped) {
@@ -851,17 +1182,27 @@ impl CompiledLexer {
     }
 
     #[inline]
-    fn dfa_search(
+    fn dfa_search<const PROFILE: bool>(
         entry: &MultiDfaEntry,
         h_cache: &mut Option<HybridCache>,
         m_cache: &mut Option<MetaCache>,
         input: &Input<'_>,
+        prof: &mut ProfileCounters,
     ) -> Option<(usize, usize)> {
+        if PROFILE {
+            prof.dfa_searches += 1;
+        }
         if let Some(h_dfa) = &entry.hybrid {
             let hc = h_cache.get_or_insert_with(|| h_dfa.create_cache());
             if let Ok(opt_hm) = h_dfa.try_search_fwd(hc, input) {
+                if PROFILE {
+                    prof.dfa_hybrid_hits += 1;
+                }
                 return opt_hm.map(|hm| (entry.pat_to_rule[hm.pattern().as_usize()], hm.offset()));
             }
+        }
+        if PROFILE {
+            prof.dfa_meta_fallbacks += 1;
         }
         let mc = m_cache.get_or_insert_with(|| entry.meta.create_cache());
         entry
@@ -871,7 +1212,7 @@ impl CompiledLexer {
     }
 
     #[inline]
-    fn try_single_rule_pure(
+    fn try_single_rule_pure<const PROFILE: bool>(
         rule: &CompiledRule,
         meta_cache_slot: &mut Option<MetaCache>,
         caps_slot: &mut Option<Captures>,
@@ -879,6 +1220,7 @@ impl CompiledLexer {
         byte_pos: usize,
         cursor: &mut FastCharCursor<'_>,
         spans: &mut Vec<SpanRec>,
+        prof: &mut ProfileCounters,
     ) -> Option<usize> {
         match (&rule.engine, &rule.action) {
             (Engine::Automata(re), ActionKind::ByGroups(group_tokens)) => {
@@ -913,7 +1255,17 @@ impl CompiledLexer {
                 None
             }
             (Engine::Fancy(re), ActionKind::ByGroups(group_tokens)) => {
-                if let Ok(Some(caps)) = re.captures_from_pos(text, byte_pos) {
+                let t0 = if PROFILE {
+                    prof.fancy_verify_calls += 1;
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let res = re.captures_from_pos(text, byte_pos);
+                if let Some(start_t) = t0 {
+                    prof.fancy_ns += start_t.elapsed().as_nanos() as u64;
+                }
+                if let Ok(Some(caps)) = res {
                     if let Some(m0) = caps.get(0) {
                         if m0.start() == byte_pos {
                             let end_byte = m0.end();
@@ -939,7 +1291,17 @@ impl CompiledLexer {
                 None
             }
             (Engine::Fancy(re), action) => {
-                if let Ok(Some(m)) = re.find_from_pos(text, byte_pos) {
+                let t0 = if PROFILE {
+                    prof.fancy_verify_calls += 1;
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let res = re.find_from_pos(text, byte_pos);
+                if let Some(start_t) = t0 {
+                    prof.fancy_ns += start_t.elapsed().as_nanos() as u64;
+                }
+                if let Ok(Some(m)) = res {
                     if m.start() == byte_pos {
                         if let ActionKind::Token(tid) = action {
                             Self::push_span(cursor, byte_pos, m.end(), *tid, spans);
@@ -953,7 +1315,7 @@ impl CompiledLexer {
         }
     }
 
-    fn run_pure_rust(
+    fn run_pure_rust<const PROFILE: bool>(
         &self,
         text: &str,
         initial_stack: Vec<usize>,
@@ -961,7 +1323,7 @@ impl CompiledLexer {
         min_emit_byte: usize,
         max_byte_end: Option<usize>,
         need_char_offsets: bool,
-    ) -> (Vec<SpanRec>, Vec<usize>) {
+    ) -> (Vec<SpanRec>, Vec<usize>, ProfileCounters) {
         let mut cursor = FastCharCursor::new(text, min_emit_byte, max_byte_end, need_char_offsets);
         let mut statestack = initial_stack;
         if statestack.is_empty() {
@@ -974,6 +1336,7 @@ impl CompiledLexer {
             .min(text.len())
             .saturating_sub(cursor.min_emit_byte);
         let mut spans: Vec<SpanRec> = Vec::with_capacity(estimated_bytes / 6 + 16);
+        let mut prof = ProfileCounters::default();
         let text_len = text.len();
         let mut byte_pos = 0usize;
         let mut zero_width_streak = 0u32;
@@ -991,125 +1354,145 @@ impl CompiledLexer {
 
             let mut matched = false;
             let mut min_idx = 0usize;
+            let mut unindexed_floor = 0usize;
 
-            loop {
-                if let Some(dfa_idx) = state.dfa_index_starting_at(min_idx) {
-                    let entry = &state.dfas[dfa_idx];
-                    let input = Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
-                    let candidate = Self::dfa_search(
-                        entry,
-                        &mut h_caches[dfa_idx],
-                        &mut m_caches[dfa_idx],
-                        &input,
-                    );
-
-                    let limit_idx = candidate.map_or(state.rules.len(), |(idx, _)| idx);
-
-                    let mut unindexed_win: Option<(usize, usize)> = None;
-                    for &u_idx in &state.unindexed_rules {
-                        if u_idx < min_idx {
-                            continue;
-                        }
-                        if u_idx >= limit_idx {
-                            break;
-                        }
-                        if let Some(end_b) = Self::try_single_rule_pure(
-                            &state.rules[u_idx],
-                            &mut r_meta_caches[u_idx],
-                            &mut r_caps[u_idx],
-                            text,
-                            byte_pos,
-                            &mut cursor,
-                            &mut spans,
-                        ) {
-                            unindexed_win = Some((u_idx, end_b));
-                            break;
-                        }
+            // Check unindexed rules that appear before any DFA rule first (avoid unnecessary DFA execution).
+            for &u_idx in &state.unindexed_rules {
+                if u_idx >= state.first_dfa_rule_idx {
+                    break;
+                }
+                if let Some(end_b) = Self::try_single_rule_pure::<PROFILE>(
+                    &state.rules[u_idx],
+                    &mut r_meta_caches[u_idx],
+                    &mut r_caps[u_idx],
+                    text,
+                    byte_pos,
+                    &mut cursor,
+                    &mut spans,
+                    &mut prof,
+                ) {
+                    if end_b == byte_pos {
+                        zero_width_streak += 1;
+                    } else {
+                        zero_width_streak = 0;
                     }
-
-                    if let Some((win_u, end_b)) = unindexed_win {
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !state.rules[win_u].ops.is_empty() {
-                            self.apply_ops(&state.rules[win_u].ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
+                    byte_pos = end_b;
+                    if !state.rules[u_idx].ops.is_empty() {
+                        self.apply_ops(&state.rules[u_idx].ops, &mut statestack);
                     }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                unindexed_floor = state.first_dfa_rule_idx;
+            }
 
-                    let Some((win_idx, dfa_end)) = candidate else {
-                        break;
-                    };
+            if !matched {
+                loop {
+                    if let Some(dfa_idx) = state.dfa_index_starting_at(min_idx) {
+                        let entry = &state.dfas[dfa_idx];
+                        let input = Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
+                        let candidate = Self::dfa_search::<PROFILE>(
+                            entry,
+                            &mut h_caches[dfa_idx],
+                            &mut m_caches[dfa_idx],
+                            &input,
+                            &mut prof,
+                        );
 
-                    let rule = &state.rules[win_idx];
-                    if !rule.needs_fancy_verify {
-                        let end_b = match &rule.action {
-                            ActionKind::Token(tid) => {
-                                Self::push_span(&mut cursor, byte_pos, dfa_end, *tid, &mut spans);
-                                dfa_end
+                        let limit_idx = candidate.map_or(state.rules.len(), |(idx, _)| idx);
+                        let check_from = min_idx.max(unindexed_floor);
+
+                        let mut unindexed_win: Option<(usize, usize)> = None;
+                        for &u_idx in &state.unindexed_rules {
+                            if u_idx < check_from {
+                                continue;
                             }
-                            ActionKind::None => dfa_end,
-                            ActionKind::ByGroups(_) => Self::try_single_rule_pure(
-                                rule,
-                                &mut r_meta_caches[win_idx],
-                                &mut r_caps[win_idx],
+                            if u_idx >= limit_idx {
+                                break;
+                            }
+                            if let Some(end_b) = Self::try_single_rule_pure::<PROFILE>(
+                                &state.rules[u_idx],
+                                &mut r_meta_caches[u_idx],
+                                &mut r_caps[u_idx],
                                 text,
                                 byte_pos,
                                 &mut cursor,
                                 &mut spans,
-                            )
-                            .unwrap_or(dfa_end),
-                            ActionKind::PyCallback(_) => unreachable!(),
+                                &mut prof,
+                            ) {
+                                unindexed_win = Some((u_idx, end_b));
+                                break;
+                            }
+                        }
+
+                        if let Some((win_u, end_b)) = unindexed_win {
+                            if end_b == byte_pos {
+                                zero_width_streak += 1;
+                            } else {
+                                zero_width_streak = 0;
+                            }
+                            byte_pos = end_b;
+                            if !state.rules[win_u].ops.is_empty() {
+                                self.apply_ops(&state.rules[win_u].ops, &mut statestack);
+                            }
+                            matched = true;
+                            break;
+                        }
+
+                        let Some((win_idx, dfa_end)) = candidate else {
+                            break;
                         };
 
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !rule.ops.is_empty() {
-                            self.apply_ops(&rule.ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
-                    } else if let Some(end_b) = Self::try_single_rule_pure(
-                        rule,
-                        &mut r_meta_caches[win_idx],
-                        &mut r_caps[win_idx],
-                        text,
-                        byte_pos,
-                        &mut cursor,
-                        &mut spans,
-                    ) {
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !rule.ops.is_empty() {
-                            self.apply_ops(&rule.ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
-                    } else {
-                        min_idx = win_idx + 1;
-                    }
-                } else {
-                    for idx in min_idx..state.rules.len() {
-                        if let Some(end_b) = Self::try_single_rule_pure(
-                            &state.rules[idx],
-                            &mut r_meta_caches[idx],
-                            &mut r_caps[idx],
+                        let rule = &state.rules[win_idx];
+                        if !rule.needs_fancy_verify {
+                            let end_b = match &rule.action {
+                                ActionKind::Token(tid) => {
+                                    Self::push_span(
+                                        &mut cursor,
+                                        byte_pos,
+                                        dfa_end,
+                                        *tid,
+                                        &mut spans,
+                                    );
+                                    dfa_end
+                                }
+                                ActionKind::None => dfa_end,
+                                ActionKind::ByGroups(_) => Self::try_single_rule_pure::<PROFILE>(
+                                    rule,
+                                    &mut r_meta_caches[win_idx],
+                                    &mut r_caps[win_idx],
+                                    text,
+                                    byte_pos,
+                                    &mut cursor,
+                                    &mut spans,
+                                    &mut prof,
+                                )
+                                .unwrap_or(dfa_end),
+                                ActionKind::PyCallback(_) => unreachable!(),
+                            };
+
+                            if end_b == byte_pos {
+                                zero_width_streak += 1;
+                            } else {
+                                zero_width_streak = 0;
+                            }
+                            byte_pos = end_b;
+                            if !rule.ops.is_empty() {
+                                self.apply_ops(&rule.ops, &mut statestack);
+                            }
+                            matched = true;
+                            break;
+                        } else if let Some(end_b) = Self::try_single_rule_pure::<PROFILE>(
+                            rule,
+                            &mut r_meta_caches[win_idx],
+                            &mut r_caps[win_idx],
                             text,
                             byte_pos,
                             &mut cursor,
                             &mut spans,
+                            &mut prof,
                         ) {
                             if end_b == byte_pos {
                                 zero_width_streak += 1;
@@ -1117,14 +1500,45 @@ impl CompiledLexer {
                                 zero_width_streak = 0;
                             }
                             byte_pos = end_b;
-                            if !state.rules[idx].ops.is_empty() {
-                                self.apply_ops(&state.rules[idx].ops, &mut statestack);
+                            if !rule.ops.is_empty() {
+                                self.apply_ops(&rule.ops, &mut statestack);
                             }
                             matched = true;
                             break;
+                        } else {
+                            if PROFILE {
+                                prof.superset_false_positives += 1;
+                            }
+                            min_idx = win_idx + 1;
                         }
+                    } else {
+                        let start_scan = min_idx.max(unindexed_floor);
+                        for idx in start_scan..state.rules.len() {
+                            if let Some(end_b) = Self::try_single_rule_pure::<PROFILE>(
+                                &state.rules[idx],
+                                &mut r_meta_caches[idx],
+                                &mut r_caps[idx],
+                                text,
+                                byte_pos,
+                                &mut cursor,
+                                &mut spans,
+                                &mut prof,
+                            ) {
+                                if end_b == byte_pos {
+                                    zero_width_streak += 1;
+                                } else {
+                                    zero_width_streak = 0;
+                                }
+                                byte_pos = end_b;
+                                if !state.rules[idx].ops.is_empty() {
+                                    self.apply_ops(&state.rules[idx].ops, &mut statestack);
+                                }
+                                matched = true;
+                                break;
+                            }
+                        }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -1164,11 +1578,14 @@ impl CompiledLexer {
             }
         }
 
-        (spans, statestack)
+        if PROFILE {
+            prof.tokens_emitted = spans.len() as u64;
+        }
+        (spans, statestack, prof)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn try_single_rule_py(
+    fn try_single_rule_py<const PROFILE: bool>(
         &self,
         py: Python<'_>,
         rule: &CompiledRule,
@@ -1181,9 +1598,10 @@ impl CompiledLexer {
         cursor: &mut FastCharCursor<'_>,
         spans: &mut Vec<SpanRec>,
         overrides: &mut Vec<(usize, Py<PyAny>, Py<PyAny>)>,
+        prof: &mut ProfileCounters,
     ) -> PyResult<Option<usize>> {
         match (&rule.engine, &rule.action) {
-            (Engine::Automata(_), ActionKind::PyCallback(cb)) => self.invoke_py_rule(
+            (Engine::Automata(_), ActionKind::PyCallback(cb)) => self.invoke_py_rule::<PROFILE>(
                 py,
                 cursor,
                 text,
@@ -1194,14 +1612,25 @@ impl CompiledLexer {
                 byte_pos,
                 spans,
                 overrides,
+                prof,
             ),
             (Engine::Fancy(re), ActionKind::PyCallback(cb)) => {
-                let matched_here = match re.find_from_pos(text, byte_pos) {
+                let t0 = if PROFILE {
+                    prof.fancy_verify_calls += 1;
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let res = re.find_from_pos(text, byte_pos);
+                if let Some(start_t) = t0 {
+                    prof.fancy_ns += start_t.elapsed().as_nanos() as u64;
+                }
+                let matched_here = match res {
                     Ok(Some(m)) => m.start() == byte_pos,
                     _ => false,
                 };
                 if matched_here {
-                    self.invoke_py_rule(
+                    self.invoke_py_rule::<PROFILE>(
                         py,
                         cursor,
                         text,
@@ -1212,12 +1641,13 @@ impl CompiledLexer {
                         byte_pos,
                         spans,
                         overrides,
+                        prof,
                     )
                 } else {
                     Ok(None)
                 }
             }
-            (Engine::PyOnly, ActionKind::PyCallback(cb)) => self.invoke_py_rule(
+            (Engine::PyOnly, ActionKind::PyCallback(cb)) => self.invoke_py_rule::<PROFILE>(
                 py,
                 cursor,
                 text,
@@ -1228,8 +1658,15 @@ impl CompiledLexer {
                 byte_pos,
                 spans,
                 overrides,
+                prof,
             ),
             (Engine::PyOnly, ActionKind::Token(tid)) => {
+                let t0 = if PROFILE {
+                    prof.py_regex_calls += 1;
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let char_pos = cursor.to_char(byte_pos);
                 let m = rule
                     .py_rexmatch
@@ -1237,16 +1674,29 @@ impl CompiledLexer {
                     .unwrap()
                     .bind(py)
                     .call1((py_text, char_pos))?;
-                if !m.is_none() {
-                    let end_char: usize = m.call_method0("end")?.extract()?;
+                let out = if !m.is_none() {
+                    if PROFILE {
+                        prof.py_regex_hits += 1;
+                    }
+                    let end_char: usize = m.call_method0(pyo3::intern!(py, "end"))?.extract()?;
                     let end_byte = cursor.to_byte(end_char);
                     Self::push_span(cursor, byte_pos, end_byte, *tid, spans);
-                    Ok(Some(end_byte))
+                    Some(end_byte)
                 } else {
-                    Ok(None)
+                    None
+                };
+                if let Some(start_t) = t0 {
+                    prof.py_fallback_ns += start_t.elapsed().as_nanos() as u64;
                 }
+                Ok(out)
             }
             (Engine::PyOnly, ActionKind::None) => {
+                let t0 = if PROFILE {
+                    prof.py_regex_calls += 1;
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let char_pos = cursor.to_char(byte_pos);
                 let m = rule
                     .py_rexmatch
@@ -1254,14 +1704,21 @@ impl CompiledLexer {
                     .unwrap()
                     .bind(py)
                     .call1((py_text, char_pos))?;
-                if !m.is_none() {
-                    let end_char: usize = m.call_method0("end")?.extract()?;
-                    Ok(Some(cursor.to_byte(end_char)))
+                let out = if !m.is_none() {
+                    if PROFILE {
+                        prof.py_regex_hits += 1;
+                    }
+                    let end_char: usize = m.call_method0(pyo3::intern!(py, "end"))?.extract()?;
+                    Some(cursor.to_byte(end_char))
                 } else {
-                    Ok(None)
+                    None
+                };
+                if let Some(start_t) = t0 {
+                    prof.py_fallback_ns += start_t.elapsed().as_nanos() as u64;
                 }
+                Ok(out)
             }
-            _ => Ok(Self::try_single_rule_pure(
+            _ => Ok(Self::try_single_rule_pure::<PROFILE>(
                 rule,
                 meta_cache_slot,
                 caps_slot,
@@ -1269,12 +1726,13 @@ impl CompiledLexer {
                 byte_pos,
                 cursor,
                 spans,
+                prof,
             )),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_with_python(
+    fn run_with_python<const PROFILE: bool>(
         &self,
         py: Python<'_>,
         text: &str,
@@ -1285,7 +1743,12 @@ impl CompiledLexer {
         min_emit_byte: usize,
         max_byte_end: Option<usize>,
         need_char_offsets: bool,
-    ) -> PyResult<(Vec<SpanRec>, Vec<(usize, Py<PyAny>, Py<PyAny>)>, Vec<usize>)> {
+    ) -> PyResult<(
+        Vec<SpanRec>,
+        Vec<(usize, Py<PyAny>, Py<PyAny>)>,
+        Vec<usize>,
+        ProfileCounters,
+    )> {
         let mut cursor = FastCharCursor::new(text, min_emit_byte, max_byte_end, need_char_offsets);
         let mut statestack = initial_stack;
         if statestack.is_empty() {
@@ -1299,6 +1762,7 @@ impl CompiledLexer {
             .saturating_sub(cursor.min_emit_byte);
         let mut spans: Vec<SpanRec> = Vec::with_capacity(estimated_bytes / 6 + 16);
         let mut overrides: Vec<(usize, Py<PyAny>, Py<PyAny>)> = Vec::new();
+        let mut prof = ProfileCounters::default();
         let text_len = text.len();
         let mut byte_pos = 0usize;
         let mut zero_width_streak = 0u32;
@@ -1316,170 +1780,73 @@ impl CompiledLexer {
 
             let mut matched = false;
             let mut min_idx = 0usize;
+            let mut unindexed_floor = 0usize;
 
-            loop {
-                if let Some(dfa_idx) = state.dfa_index_starting_at(min_idx) {
-                    let entry = &state.dfas[dfa_idx];
-                    let input = Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
-                    let candidate = Self::dfa_search(
-                        entry,
-                        &mut h_caches[dfa_idx],
-                        &mut m_caches[dfa_idx],
-                        &input,
-                    );
-
-                    let limit_idx = candidate.map_or(state.rules.len(), |(idx, _)| idx);
-
-                    let mut unindexed_win: Option<(usize, usize)> = None;
-                    for &u_idx in &state.unindexed_rules {
-                        if u_idx < min_idx {
-                            continue;
-                        }
-                        if u_idx >= limit_idx {
-                            break;
-                        }
-                        if let Some(end_b) = self.try_single_rule_py(
-                            py,
-                            &state.rules[u_idx],
-                            &mut r_meta_caches[u_idx],
-                            &mut r_caps[u_idx],
-                            text,
-                            py_text,
-                            py_lexer,
-                            byte_pos,
-                            &mut cursor,
-                            &mut spans,
-                            &mut overrides,
-                        )? {
-                            unindexed_win = Some((u_idx, end_b));
-                            break;
-                        }
-                    }
-
-                    if let Some((win_u, end_b)) = unindexed_win {
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !state.rules[win_u].ops.is_empty() {
-                            self.apply_ops(&state.rules[win_u].ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
-                    }
-
-                    let Some((win_idx, dfa_end)) = candidate else {
-                        break;
-                    };
-
-                    let rule = &state.rules[win_idx];
-                    if !rule.needs_fancy_verify {
-                        let end_b = match &rule.action {
-                            ActionKind::Token(tid) => {
-                                Self::push_span(&mut cursor, byte_pos, dfa_end, *tid, &mut spans);
-                                dfa_end
-                            }
-                            ActionKind::None => dfa_end,
-                            ActionKind::ByGroups(_) => Self::try_single_rule_pure(
-                                rule,
-                                &mut r_meta_caches[win_idx],
-                                &mut r_caps[win_idx],
-                                text,
-                                byte_pos,
-                                &mut cursor,
-                                &mut spans,
-                            )
-                            .unwrap_or(dfa_end),
-                            ActionKind::PyCallback(cb) => self
-                                .invoke_py_rule(
-                                    py,
-                                    &mut cursor,
-                                    text,
-                                    py_text,
-                                    py_lexer,
-                                    rule.py_rexmatch.as_ref().unwrap(),
-                                    Some(cb),
-                                    byte_pos,
-                                    &mut spans,
-                                    &mut overrides,
-                                )?
-                                .unwrap_or(dfa_end),
-                        };
-
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !rule.ops.is_empty() {
-                            self.apply_ops(&rule.ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
-                    } else if let Some(end_b) = self.try_single_rule_py(
-                        py,
-                        rule,
-                        &mut r_meta_caches[win_idx],
-                        &mut r_caps[win_idx],
-                        text,
-                        py_text,
-                        py_lexer,
-                        byte_pos,
-                        &mut cursor,
-                        &mut spans,
-                        &mut overrides,
-                    )? {
-                        if end_b == byte_pos {
-                            zero_width_streak += 1;
-                        } else {
-                            zero_width_streak = 0;
-                        }
-                        byte_pos = end_b;
-                        if !rule.ops.is_empty() {
-                            self.apply_ops(&rule.ops, &mut statestack);
-                        }
-                        matched = true;
-                        break;
+            // Check unindexed rules that appear before any DFA rule first (avoid unnecessary DFA execution).
+            for &u_idx in &state.unindexed_rules {
+                if u_idx >= state.first_dfa_rule_idx {
+                    break;
+                }
+                if let Some(end_b) = self.try_single_rule_py::<PROFILE>(
+                    py,
+                    &state.rules[u_idx],
+                    &mut r_meta_caches[u_idx],
+                    &mut r_caps[u_idx],
+                    text,
+                    py_text,
+                    py_lexer,
+                    byte_pos,
+                    &mut cursor,
+                    &mut spans,
+                    &mut overrides,
+                    &mut prof,
+                )? {
+                    if end_b == byte_pos {
+                        zero_width_streak += 1;
                     } else {
-                        min_idx = win_idx + 1;
+                        zero_width_streak = 0;
                     }
-                } else {
-                    for idx in min_idx..state.rules.len() {
-                        let rule = &state.rules[idx];
-                        let matched_opt = if matches!(&rule.engine, Engine::Automata(_))
-                            && matches!(&rule.action, ActionKind::PyCallback(_))
-                        {
-                            let Engine::Automata(re) = &rule.engine else {
-                                unreachable!()
-                            };
-                            let mc = r_meta_caches[idx].get_or_insert_with(|| re.create_cache());
-                            let input = Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
-                            if re.search_half_with(mc, &input).is_some() {
-                                self.try_single_rule_py(
-                                    py,
-                                    rule,
-                                    &mut r_meta_caches[idx],
-                                    &mut r_caps[idx],
-                                    text,
-                                    py_text,
-                                    py_lexer,
-                                    byte_pos,
-                                    &mut cursor,
-                                    &mut spans,
-                                    &mut overrides,
-                                )?
-                            } else {
-                                None
+                    byte_pos = end_b;
+                    if !state.rules[u_idx].ops.is_empty() {
+                        self.apply_ops(&state.rules[u_idx].ops, &mut statestack);
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                unindexed_floor = state.first_dfa_rule_idx;
+            }
+
+            if !matched {
+                loop {
+                    if let Some(dfa_idx) = state.dfa_index_starting_at(min_idx) {
+                        let entry = &state.dfas[dfa_idx];
+                        let input = Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
+                        let candidate = Self::dfa_search::<PROFILE>(
+                            entry,
+                            &mut h_caches[dfa_idx],
+                            &mut m_caches[dfa_idx],
+                            &input,
+                            &mut prof,
+                        );
+
+                        let limit_idx = candidate.map_or(state.rules.len(), |(idx, _)| idx);
+                        let check_from = min_idx.max(unindexed_floor);
+
+                        let mut unindexed_win: Option<(usize, usize)> = None;
+                        for &u_idx in &state.unindexed_rules {
+                            if u_idx < check_from {
+                                continue;
                             }
-                        } else {
-                            self.try_single_rule_py(
+                            if u_idx >= limit_idx {
+                                break;
+                            }
+                            if let Some(end_b) = self.try_single_rule_py::<PROFILE>(
                                 py,
-                                rule,
-                                &mut r_meta_caches[idx],
-                                &mut r_caps[idx],
+                                &state.rules[u_idx],
+                                &mut r_meta_caches[u_idx],
+                                &mut r_caps[u_idx],
                                 text,
                                 py_text,
                                 py_lexer,
@@ -1487,10 +1854,73 @@ impl CompiledLexer {
                                 &mut cursor,
                                 &mut spans,
                                 &mut overrides,
-                            )?
+                                &mut prof,
+                            )? {
+                                unindexed_win = Some((u_idx, end_b));
+                                break;
+                            }
+                        }
+
+                        if let Some((win_u, end_b)) = unindexed_win {
+                            if end_b == byte_pos {
+                                zero_width_streak += 1;
+                            } else {
+                                zero_width_streak = 0;
+                            }
+                            byte_pos = end_b;
+                            if !state.rules[win_u].ops.is_empty() {
+                                self.apply_ops(&state.rules[win_u].ops, &mut statestack);
+                            }
+                            matched = true;
+                            break;
+                        }
+
+                        let Some((win_idx, dfa_end)) = candidate else {
+                            break;
                         };
 
-                        if let Some(end_b) = matched_opt {
+                        let rule = &state.rules[win_idx];
+                        if !rule.needs_fancy_verify {
+                            let end_b = match &rule.action {
+                                ActionKind::Token(tid) => {
+                                    Self::push_span(
+                                        &mut cursor,
+                                        byte_pos,
+                                        dfa_end,
+                                        *tid,
+                                        &mut spans,
+                                    );
+                                    dfa_end
+                                }
+                                ActionKind::None => dfa_end,
+                                ActionKind::ByGroups(_) => Self::try_single_rule_pure::<PROFILE>(
+                                    rule,
+                                    &mut r_meta_caches[win_idx],
+                                    &mut r_caps[win_idx],
+                                    text,
+                                    byte_pos,
+                                    &mut cursor,
+                                    &mut spans,
+                                    &mut prof,
+                                )
+                                .unwrap_or(dfa_end),
+                                ActionKind::PyCallback(cb) => self
+                                    .invoke_py_rule::<PROFILE>(
+                                        py,
+                                        &mut cursor,
+                                        text,
+                                        py_text,
+                                        py_lexer,
+                                        rule.py_rexmatch.as_ref().unwrap(),
+                                        Some(cb),
+                                        byte_pos,
+                                        &mut spans,
+                                        &mut overrides,
+                                        &mut prof,
+                                    )?
+                                    .unwrap_or(dfa_end),
+                            };
+
                             if end_b == byte_pos {
                                 zero_width_streak += 1;
                             } else {
@@ -1502,9 +1932,102 @@ impl CompiledLexer {
                             }
                             matched = true;
                             break;
+                        } else if let Some(end_b) = self.try_single_rule_py::<PROFILE>(
+                            py,
+                            rule,
+                            &mut r_meta_caches[win_idx],
+                            &mut r_caps[win_idx],
+                            text,
+                            py_text,
+                            py_lexer,
+                            byte_pos,
+                            &mut cursor,
+                            &mut spans,
+                            &mut overrides,
+                            &mut prof,
+                        )? {
+                            if end_b == byte_pos {
+                                zero_width_streak += 1;
+                            } else {
+                                zero_width_streak = 0;
+                            }
+                            byte_pos = end_b;
+                            if !rule.ops.is_empty() {
+                                self.apply_ops(&rule.ops, &mut statestack);
+                            }
+                            matched = true;
+                            break;
+                        } else {
+                            if PROFILE {
+                                prof.superset_false_positives += 1;
+                            }
+                            min_idx = win_idx + 1;
                         }
+                    } else {
+                        let start_scan = min_idx.max(unindexed_floor);
+                        for idx in start_scan..state.rules.len() {
+                            let rule = &state.rules[idx];
+                            let matched_opt = if matches!(&rule.engine, Engine::Automata(_))
+                                && matches!(&rule.action, ActionKind::PyCallback(_))
+                            {
+                                let Engine::Automata(re) = &rule.engine else {
+                                    unreachable!()
+                                };
+                                let mc =
+                                    r_meta_caches[idx].get_or_insert_with(|| re.create_cache());
+                                let input =
+                                    Input::new(text).range(byte_pos..).anchored(Anchored::Yes);
+                                if re.search_half_with(mc, &input).is_some() {
+                                    self.try_single_rule_py::<PROFILE>(
+                                        py,
+                                        rule,
+                                        &mut r_meta_caches[idx],
+                                        &mut r_caps[idx],
+                                        text,
+                                        py_text,
+                                        py_lexer,
+                                        byte_pos,
+                                        &mut cursor,
+                                        &mut spans,
+                                        &mut overrides,
+                                        &mut prof,
+                                    )?
+                                } else {
+                                    None
+                                }
+                            } else {
+                                self.try_single_rule_py::<PROFILE>(
+                                    py,
+                                    rule,
+                                    &mut r_meta_caches[idx],
+                                    &mut r_caps[idx],
+                                    text,
+                                    py_text,
+                                    py_lexer,
+                                    byte_pos,
+                                    &mut cursor,
+                                    &mut spans,
+                                    &mut overrides,
+                                    &mut prof,
+                                )?
+                            };
+
+                            if let Some(end_b) = matched_opt {
+                                if end_b == byte_pos {
+                                    zero_width_streak += 1;
+                                } else {
+                                    zero_width_streak = 0;
+                                }
+                                byte_pos = end_b;
+                                if !rule.ops.is_empty() {
+                                    self.apply_ops(&rule.ops, &mut statestack);
+                                }
+                                matched = true;
+                                break;
+                            }
+                        }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -1544,11 +2067,14 @@ impl CompiledLexer {
             }
         }
 
-        Ok((spans, overrides, statestack))
+        if PROFILE {
+            prof.tokens_emitted = spans.len() as u64;
+        }
+        Ok((spans, overrides, statestack, prof))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn invoke_py_rule(
+    fn invoke_py_rule<const PROFILE: bool>(
         &self,
         py: Python<'_>,
         cursor: &mut FastCharCursor<'_>,
@@ -1560,15 +2086,32 @@ impl CompiledLexer {
         byte_pos: usize,
         spans: &mut Vec<SpanRec>,
         overrides: &mut Vec<(usize, Py<PyAny>, Py<PyAny>)>,
+        prof: &mut ProfileCounters,
     ) -> PyResult<Option<usize>> {
+        let t0 = if PROFILE {
+            prof.py_regex_calls += 1;
+            Some(Instant::now())
+        } else {
+            None
+        };
+
         let char_pos = cursor.to_char(byte_pos);
         let m = py_rexmatch.bind(py).call1((py_text, char_pos))?;
         if m.is_none() {
+            if let Some(start_t) = t0 {
+                prof.py_fallback_ns += start_t.elapsed().as_nanos() as u64;
+            }
             return Ok(None);
         }
-        let end_char: usize = m.call_method0("end")?.extract()?;
+        if PROFILE {
+            prof.py_regex_hits += 1;
+        }
+        let end_char: usize = m.call_method0(pyo3::intern!(py, "end"))?.extract()?;
 
         if let Some(cb) = py_action {
+            if PROFILE {
+                prof.py_callback_calls += 1;
+            }
             let iter = cb.bind(py).call1((py_lexer, &m))?;
             for item_res in iter.try_iter()? {
                 let item = item_res?;
@@ -1585,9 +2128,9 @@ impl CompiledLexer {
 
                 let total_chars = cursor.total_char_len();
                 let (sb, eb, matches_slice) = match pos_c.checked_add(val_char_len) {
-                    Some(end_char) if end_char <= total_chars => {
+                    Some(span_end_char) if span_end_char <= total_chars => {
                         let sb = cursor.to_byte(pos_c);
-                        let eb = cursor.to_byte(end_char);
+                        let eb = cursor.to_byte(span_end_char);
                         (sb, eb, &text[sb..eb] == val_str)
                     }
                     _ => {
@@ -1617,10 +2160,14 @@ impl CompiledLexer {
             }
         }
 
-        Ok(Some(cursor.to_byte(end_char)))
+        let end_byte = cursor.to_byte(end_char);
+        if let Some(start_t) = t0 {
+            prof.py_fallback_ns += start_t.elapsed().as_nanos() as u64;
+        }
+        Ok(Some(end_byte))
     }
 
-    fn execute_core<'py>(
+    fn execute_core<'py, const PROFILE: bool>(
         &self,
         py: Python<'py>,
         text: &Bound<'py, PyString>,
@@ -1633,6 +2180,7 @@ impl CompiledLexer {
         Vec<SpanRec>,
         Vec<(usize, Py<PyAny>, Py<PyAny>)>,
         Vec<String>,
+        ProfileCounters,
     )> {
         let initial_stack = self.resolve_stack(stack)?;
 
@@ -1646,10 +2194,10 @@ impl CompiledLexer {
         let text_str = text.to_str()?;
         let result = if !self.has_py_fallback {
             let scan_limit = max_byte_end.unwrap_or(text_str.len()).min(text_str.len());
-            let (spans, final_stack, returned_scratch) = if scan_limit >= 16_384 {
+            let (spans, final_stack, prof, returned_scratch) = if scan_limit >= 16_384 {
                 let owned = text_str.to_owned();
                 py.detach(move || {
-                    let (s, st) = self.run_pure_rust(
+                    let (s, st, p) = self.run_pure_rust::<PROFILE>(
                         &owned,
                         initial_stack,
                         &mut scratch,
@@ -1657,10 +2205,10 @@ impl CompiledLexer {
                         max_byte_end,
                         need_char_offsets,
                     );
-                    (s, st, scratch)
+                    (s, st, p, scratch)
                 })
             } else {
-                let (s, st) = self.run_pure_rust(
+                let (s, st, p) = self.run_pure_rust::<PROFILE>(
                     text_str,
                     initial_stack,
                     &mut scratch,
@@ -1668,16 +2216,16 @@ impl CompiledLexer {
                     max_byte_end,
                     need_char_offsets,
                 );
-                (s, st, scratch)
+                (s, st, p, scratch)
             };
             scratch = returned_scratch;
             let final_names = final_stack
                 .into_iter()
                 .map(|id| self.state_id_to_name[id].clone())
                 .collect();
-            Ok((spans, Vec::new(), final_names))
+            Ok((spans, Vec::new(), final_names, prof))
         } else {
-            let (spans, overrides, final_stack) = self.run_with_python(
+            let (spans, overrides, final_stack, prof) = self.run_with_python::<PROFILE>(
                 py,
                 text_str,
                 text,
@@ -1692,7 +2240,7 @@ impl CompiledLexer {
                 .into_iter()
                 .map(|id| self.state_id_to_name[id].clone())
                 .collect();
-            Ok((spans, overrides, final_names))
+            Ok((spans, overrides, final_names, prof))
         };
 
         if let Ok(mut guard) = self.scratch.try_lock() {
@@ -1747,8 +2295,8 @@ impl CompiledLexer {
         stack: Option<Vec<String>>,
     ) -> PyResult<Py<PyList>> {
         let text_str = text.to_str()?;
-        let (spans, overrides, _final_stack) =
-            self.execute_core(py, text, py_lexer, stack, 0, None, true)?;
+        let (spans, overrides, _final_stack, _prof) =
+            self.execute_core::<false>(py, text, py_lexer, stack, 0, None, true)?;
 
         let tok_cache = self.snapshot_token_vec(py)?;
         let mut py_items: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(spans.len());
@@ -1784,8 +2332,8 @@ impl CompiledLexer {
         py_lexer: &Bound<'py, PyAny>,
         stack: Option<Vec<String>>,
     ) -> PyResult<(Vec<(usize, usize, u32)>, Py<PyTuple>, Vec<String>)> {
-        let (spans, _overrides, final_stack) =
-            self.execute_core(py, text, py_lexer, stack, 0, None, true)?;
+        let (spans, _overrides, final_stack, _prof) =
+            self.execute_core::<false>(py, text, py_lexer, stack, 0, None, true)?;
         let table = self.token_table(py)?;
         let out = spans
             .into_iter()
@@ -1802,8 +2350,8 @@ impl CompiledLexer {
         py_lexer: &Bound<'py, PyAny>,
         stack: Option<Vec<String>>,
     ) -> PyResult<(Bound<'py, PyBytes>, Py<PyTuple>, Vec<String>)> {
-        let (spans, _overrides, final_stack) =
-            self.execute_core(py, text, py_lexer, stack, 0, None, true)?;
+        let (spans, _overrides, final_stack, _prof) =
+            self.execute_core::<false>(py, text, py_lexer, stack, 0, None, true)?;
         let table = self.token_table(py)?;
         let mut buf = Vec::with_capacity(spans.len() * 12);
         for r in &spans {
@@ -1812,6 +2360,26 @@ impl CompiledLexer {
             buf.extend_from_slice(&r.tid.to_le_bytes());
         }
         Ok((PyBytes::new(py, &buf), table, final_stack))
+    }
+
+    #[pyo3(signature = (text, py_lexer, stack=None))]
+    fn lex_flat_spans_profiled<'py>(
+        &self,
+        py: Python<'py>,
+        text: &Bound<'py, PyString>,
+        py_lexer: &Bound<'py, PyAny>,
+        stack: Option<Vec<String>>,
+    ) -> PyResult<(Bound<'py, PyBytes>, Py<PyTuple>, Vec<String>, LexProfile)> {
+        let (spans, _overrides, final_stack, prof) =
+            self.execute_core::<true>(py, text, py_lexer, stack, 0, None, true)?;
+        let table = self.token_table(py)?;
+        let mut buf = Vec::with_capacity(spans.len() * 12);
+        for r in &spans {
+            buf.extend_from_slice(&(r.char_start as u32).to_le_bytes());
+            buf.extend_from_slice(&(r.char_len as u32).to_le_bytes());
+            buf.extend_from_slice(&r.tid.to_le_bytes());
+        }
+        Ok((PyBytes::new(py, &buf), table, final_stack, prof.into()))
     }
 
     /// Return flat UTF-8 byte spans intersecting the requested range.
@@ -1836,8 +2404,8 @@ impl CompiledLexer {
             return Ok((PyBytes::new(py, &[]), self.token_table(py)?, final_stack));
         }
 
-        let (spans, _overrides, final_stack) =
-            self.execute_core(py, text, py_lexer, stack, start_byte, Some(limit), false)?;
+        let (spans, _overrides, final_stack, _prof) =
+            self.execute_core::<false>(py, text, py_lexer, stack, start_byte, Some(limit), false)?;
         let table = self.token_table(py)?;
         let mut buf = Vec::with_capacity(spans.len() * 12);
         for span in &spans {
@@ -1860,5 +2428,6 @@ impl CompiledLexer {
 fn _rsgments(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CompiledLexerBuilder>()?;
     m.add_class::<CompiledLexer>()?;
+    m.add_class::<LexProfile>()?;
     Ok(())
 }
