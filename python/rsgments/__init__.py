@@ -31,7 +31,7 @@ __all__ = [
     "LexProfile",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
