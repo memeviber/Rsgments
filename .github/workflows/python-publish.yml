@@ -154,15 +154,6 @@ jobs:
           sccache: "true"
           manylinux: auto
 
-      - name: Build cp313t wheel (free-threaded, best-effort)
-        continue-on-error: true
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -i 3.13t
-          sccache: "true"
-          manylinux: auto
-
       # Verify built wheels on native host architectures (3.9, 3.14 via abi3, and 3.14t)
       - name: Setup Python 3.9
         if: matrix.native_test
@@ -253,15 +244,6 @@ jobs:
           sccache: "true"
           manylinux: musllinux_1_2
 
-      - name: Build cp313t wheel (free-threaded, best-effort)
-        continue-on-error: true
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -i 3.13t
-          sccache: "true"
-          manylinux: musllinux_1_2
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.target }}
@@ -341,22 +323,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest dist/*-cp314t-*.whl
           pytest -v
-
-      # Python 3.13t free-threaded (best-effort)
-      - name: Setup Python 3.13t
-        id: py313t
-        continue-on-error: true
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13t"
-      - name: Build cp313t wheel
-        if: steps.py313t.outcome == 'success'
-        continue-on-error: true
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          args: --release --out dist -i 3.13t
-          sccache: "true"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -465,11 +431,6 @@ jobs:
             arch: x64
             py: "3.14t"
             allow_fail: false
-          - runner: windows-latest
-            target: x64
-            arch: x64
-            py: "3.13t"
-            allow_fail: true
           - runner: windows-latest
             target: x86
             arch: x86
