@@ -232,16 +232,16 @@ The benchmark processes approximately 5,995 lines and 81,750 tokens.
 
 | Implementation | Average time | Speedup |
 |---|---:|---:|
-| Original Pygments | 570.58 ms | 1.00x |
-| Rsgments (`get_tokens`) | 74.95 ms | 7.61x |
-| Rsgments (`lex_raw_spans`) | 55.95 ms | 10.20x |
-| Rsgments (`lex_flat_spans`) | 49.80 ms | 11.46x |
+| Original Pygments | 586.28 ms | 1.00x |
+| Rsgments (`get_tokens`) | 57.50 ms | 10.20x |
+| Rsgments (`lex_raw_spans`) | 67.94 ms | 8.63x |
+| Rsgments (`lex_flat_spans`) | 47.32 ms | 12.39x |
 
 Compared with original Pygments:
 
-- `get_tokens`: 86.9% less processing time.
-- `lex_raw_spans`: 90.2% less processing time.
-- `lex_flat_spans`: 91.3% less processing time.
+- `get_tokens`: 90.2% less processing time.
+- `lex_raw_spans`: 88.4% less processing time.
+- `lex_flat_spans`: 91.9% less processing time.
 
 ### Adversarial and Fallback Overhead Benchmarks
 
@@ -251,11 +251,11 @@ The workloads include a 24-rule lexer with 10 `PyOnly` rules intentionally place
 
 | Workload | Tokens | Pygments | Rsgments (`get_tokens`) | Rsgments (`lex_flat_spans`) | Flat throughput | Key telemetry |
 |---|---:|---:|---:|---:|---:|---|
-| **1. Native-heavy** (15 rules) | 48,800 | 140.76 ms | 24.82 ms (5.67x) | **5.78 ms (24.37x)** | 8,447.7 k tok/s (20.21 MB/s) | 47,201 `HybridDFA` hits, 0 meta/Python fallbacks |
-| **2. Fancy-heavy** (lookaround + backreference) | 92,400 | 256.56 ms | 57.32 ms (4.48x) | **28.24 ms (9.08x)** | 3,271.9 k tok/s (5.59 MB/s) | 99,601 `Fancy` calls (0.197 us average), 33.7% superset false positives |
-| **3A. PyOnly-bottom** (10 `PyOnly` rules at the bottom) | 16,160 | 29.29 ms | 6.22 ms (4.71x) | **4.43 ms (6.62x)** | 3,651.0 k tok/s (10.50 MB/s) | Only 1,838 `py_regex_calls` due to `u_idx < limit_idx` skipping |
-| **3B. PyOnly-top** (10 `PyOnly` rules at the top, 50% hit rate) | 16,000 | 65.82 ms | 34.41 ms (1.91x) | **29.33 ms (2.24x)** | 545.5 k tok/s (2.39 MB/s) | 139,203 `py_regex_calls` (0.214 us average fallback) |
-| **4. Mixed adversarial** (Native + Fancy + `PyOnly` + `using` + UTF-8) | 50,000 | 111.90 ms | 54.37 ms (2.06x) | **46.53 ms (2.40x)** | 1,074.5 k tok/s (2.75 MB/s) | 42,001 `HybridDFA` / 2,000 `meta` calls (UTF-8), 1,000 `using()` callbacks |
+| **1. Native-heavy** (15 rules) | 48,800 | 88.79 ms | 19.03 ms (4.67x) | **3.62 ms (24.53x)** | 13,497.4 k tok/s (32.29 MB/s) | 47,201 `HybridDFA` hits, 0 meta/Python fallbacks |
+| **2. Fancy-heavy** (lookaround + backreference) | 92,400 | 168.39 ms | 37.21 ms (4.52x) | **15.30 ms (11.01x)** | 6,038.9 k tok/s (10.32 MB/s) | 99,601 `Fancy` calls (0.098 us average), 33.7% superset false positives |
+| **3A. PyOnly-bottom** (10 `PyOnly` rules at the bottom) | 16,160 | 19.75 ms | 3.59 ms (5.50x) | **2.43 ms (8.13x)** | 6,657.9 k tok/s (19.15 MB/s) | Only 1,838 `py_regex_calls` due to `u_idx < limit_idx` skipping |
+| **3B. PyOnly-top** (10 `PyOnly` rules at the top, 50% hit rate) | 16,000 | 47.66 ms | 27.01 ms (1.76x) | **25.84 ms (1.84x)** | 619.1 k tok/s (2.72 MB/s) | 139,203 `py_regex_calls` (0.196 us average fallback) |
+| **4. Mixed adversarial** (Native + Fancy + `PyOnly` + `using` + UTF-8) | 50,000 | 103.37 ms | 51.20 ms (2.02x) | **46.07 ms (2.24x)** | 1,085.2 k tok/s (2.77 MB/s) | 42,001 `HybridDFA` / 2,000 `meta` calls (UTF-8), 1,000 `using()` callbacks |
 
 #### Fallback Rate Sweep
 
@@ -263,10 +263,10 @@ The workloads include a 24-rule lexer with 10 `PyOnly` rules intentionally place
 
 | Word-item fallback rate | Pygments | Rsgments (`get_tokens`) | Rsgments (`lex_flat_spans`) | `py_regex_calls` (hits) | Average fallback latency |
 |---:|---:|---:|---:|---:|---:|
-| ~10% | 55.07 ms | 29.69 ms (1.86x) | **28.61 ms (1.92x)** | 155,743 (800) | 0.197 us |
-| ~50% | 44.63 ms | 27.04 ms (1.65x) | **25.94 ms (1.72x)** | 139,203 (4,000) | 0.198 us |
-| ~90% | 33.66 ms | 24.61 ms (1.37x) | **23.71 ms (1.42x)** | 122,668 (7,200) | 0.202 us |
-| ~99% | 31.60 ms | 24.29 ms (1.30x) | **23.03 ms (1.37x)** | 118,986 (7,920) | 0.203 us |
+| ~10% | 60.22 ms | 29.33 ms (2.05x) | **28.38 ms (2.12x)** | 155,743 (800) | 0.194 us |
+| ~50% | 48.73 ms | 27.07 ms (1.80x) | **25.85 ms (1.88x)** | 139,203 (4,000) | 0.196 us |
+| ~90% | 36.73 ms | 24.45 ms (1.50x) | **23.25 ms (1.58x)** | 122,668 (7,200) | 0.201 us |
+| ~99% | 34.42 ms | 24.18 ms (1.42x) | **22.92 ms (1.50x)** | 118,986 (7,920) | 0.203 us |
 
 In these workloads, whitespace and newline separators between the 8,000 word items still match the DFA path. Consequently, approximately half of all 16,000 tokens are processed by the DFA.
 
