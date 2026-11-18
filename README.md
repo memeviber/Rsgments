@@ -12,7 +12,7 @@ Install a prebuilt wheel directly from PyPI:
 pip install rsgments
 ```
 
-Prebuilt wheels are available for Python 3.9 through 3.14 across Linux (`manylinux` and `musllinux`), macOS, and Windows, including free-threaded CPython `3.14t`. *(Note: Python 3.13t free-threaded wheels are omitted due to upstream `maturin` cross-compilation limitations; please use Python 3.14t or build from source on 3.13t).*
+Prebuilt wheels are available for Python 3.9 through 3.14 across Linux (`manylinux` and `musllinux`), macOS, and Windows, including free-threaded CPython `3.14t` and `3.13t` builds.
 
 To upgrade to the latest release:
 

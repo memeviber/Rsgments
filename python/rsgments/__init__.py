@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import re
 import threading
 import weakref
+from contextlib import contextmanager
 from typing import Iterable, Iterator, List, Optional, Tuple
 
 from pygments.lexer import ExtendedRegexLexer, RegexLexer
 from pygments.token import Error, Text, Whitespace, _TokenType
 
-from ._rsgments import CompiledLexer, CompiledLexerBuilder, LexProfile
+from ._rsgments import (
+    CompiledLexer,
+    CompiledLexerBuilder,  # type: ignore
+    LexProfile,
+)
 
 __all__ = [
     "__version__",
@@ -31,7 +35,7 @@ __all__ = [
     "LexProfile",
 ]
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
@@ -348,6 +352,7 @@ def _rs_get_tokens_unprocessed(self, text: str, stack=("root",)):
     if fallback_orig:
         return _orig_get_tokens_unprocessed(self, text, stack)
 
+
 def lex_tokens(
     lexer: RegexLexer,
     text: str,
@@ -363,7 +368,7 @@ def lex_spans(
     text: str,
     stack: Iterable[str] = ("root",),
 ) -> Tuple[List[Tuple[int, int, _TokenType]], List[str]]:
-    """Return ([(start_char, length_char, token_type), ...], final_state_stack)."""
+    """Return `([(start_char, length_char, token_type), ...], final_state_stack)`."""
     compiled = compile_lexer(lexer)
     raw_spans, table, final_stack = compiled.lex_spans(text, lexer, list(stack))
     return [(s, l, table[tid]) for s, l, tid in raw_spans], final_stack
@@ -374,7 +379,7 @@ def lex_raw_spans(
     text: str,
     stack: Iterable[str] = ("root",),
 ) -> Tuple[List[Tuple[int, int, int]], Tuple[_TokenType, ...], List[str]]:
-    """Return ([(start_char, length_char, tid), ...], token_table, final_state_stack)."""
+    """Return `([(start_char, length_char, tid), ...], token_table, final_state_stack)`."""
     compiled = compile_lexer(lexer)
     return compiled.lex_spans(text, lexer, list(stack))
 
@@ -386,7 +391,7 @@ def lex_flat_spans(
 ) -> Tuple[bytes, Tuple[_TokenType, ...], List[str]]:
     """
     Return a flat buffer for code editors such as PyQt5 QSyntaxHighlighter.
-    The result is (bytes_buf, token_table, final_state_stack).
+    The result is `(bytes_buf, token_table, final_state_stack)`.
     Read it with `mv = memoryview(bytes_buf).cast("I")`:
     `start, length, tid = mv[i], mv[i + 1], mv[i + 2]`.
     """
@@ -417,7 +422,15 @@ def lex_flat_spans_profiled(
     text: str,
     stack: Iterable[str] = ("root",),
 ) -> Tuple[bytes, Tuple[_TokenType, ...], List[str], LexProfile]:
-    """Lex a text and return flat spans with profiling information."""
+    """Lex a text and return flat spans with profiling information.
+    The result is `(bytes_buf, token_table, final_state_stack, profile)`.
+    The `profile` is a LexProfile object with profiling information contained in its attributes:
+    - `dfa_searches`: Number of DFA searches performed.
+    - `fancy_verify_calls`: Number of calls to the fancy regex verification.
+    - `superset_false_positives`: Number of false positives encountered during superset matching.
+    - `py_regex_calls`: Number of calls to Python regex functions.
+    - `py_fallback_ns`: Total time spent in Python fallback (in nanoseconds).
+    """
     compiled = compile_lexer(lexer)
     return compiled.lex_flat_spans_profiled(text, lexer, list(stack))
 
@@ -456,6 +469,7 @@ def unpatch_pygments() -> None:
 
 
 def is_patched() -> bool:
+    """Check whether Rsgments is currently enabled for Pygments RegexLexer instances."""
     with _patch_cond:
         return _patched and not _draining
 

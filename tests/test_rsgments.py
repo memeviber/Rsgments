@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from pygments.lexer import ExtendedRegexLexer, RegexLexer, bygroups, words
 from pygments.lexers import (
@@ -20,7 +21,6 @@ from pygments.lexers import (
 from pygments.token import Keyword, Name, Number, Operator, String, Text
 
 import rsgments
-
 
 PYTHON_EDGE_CASES = '''\
 # Unicode comment with emoji 🚀💡

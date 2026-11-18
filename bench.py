@@ -5,6 +5,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from pygments.lexers import PythonLexer
+
 import rsgments
 
 
