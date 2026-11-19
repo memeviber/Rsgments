@@ -35,7 +35,7 @@ __all__ = [
     "LexProfile",
 ]
 
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
@@ -402,20 +402,22 @@ def lex_flat_spans(
 def lex_flat_byte_spans(
     lexer: RegexLexer,
     text: str,
-    stack: Iterable[str] = ("root",),
+    stack: Optional[Iterable[str]] = None,
     start_byte: int = 0,
     end_byte: Optional[int] = None,
 ) -> Tuple[bytes, Tuple[_TokenType, ...], List[str]]:
     """
     Return flat UTF-8 byte-offset spans for QScintilla.
     Only tokens intersecting `[start_byte, end_byte)` are emitted, and lexing stops at
-    `end_byte`. The result is (bytes_buf, token_table, final_state_stack).
+    `end_byte`. Pass `stack` explicitly only when continuing from a known checkpoint
+    at a UTF-8 character boundary `start_byte`.
+    The result is (bytes_buf, token_table, final_state_stack).
     Read the buffer with `memoryview(bytes_buf).cast("I")` as triples of
     `(byte_start, byte_length, token_id)`.
     """
     compiled = compile_lexer(lexer)
-    return compiled.lex_flat_byte_spans(text, lexer, list(stack), start_byte, end_byte)
-
+    stack_arg = None if stack is None else list(stack)
+    return compiled.lex_flat_byte_spans(text, lexer, stack_arg, start_byte, end_byte)
 
 def lex_flat_spans_profiled(
     lexer: RegexLexer,

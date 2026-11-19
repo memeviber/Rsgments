@@ -86,20 +86,18 @@ class FancyHeavyLexer(RegexLexer):
     }
 
 
-# Helper that generates rules GUARANTEED to fall back to Engine::PyOnly
-# (Conditional & re.ASCII + \w).
 def make_pyonly_rules(prefix: str, count: int = 10):
+    first_ch = prefix[0]
+    rest = prefix[1:]
+    escaped_first = rf"\N{{LATIN SMALL LETTER {first_ch.upper()}}}"
     rules = []
     for i in range(count):
         if i % 3 == 0:
-            # (?a) + \d/\w -> Engine::PyOnly
-            rules.append((rf"(?a)(@)?{prefix}{i}(?:\(\d+\)|:\w+)", Keyword.Reserved))
+            rules.append((rf"@?{escaped_first}{rest}{i}(?:\(\d+\)|:\w+)", Keyword.Reserved))
         elif i % 3 == 1:
-            # (?a) + \w/\d -> Engine::PyOnly
-            rules.append((rf"(?a)!?{prefix}{i}_[a-z]+\d*", Name.Decorator))
+            rules.append((rf"!?{escaped_first}{rest}{i}_[a-z]+\d*", Name.Decorator))
         else:
-            # (?a) + \w+ -> Engine::PyOnly
-            rules.append((rf"(?a){prefix}{i}\w+", Name.Tag))
+            rules.append((rf"{escaped_first}{rest}{i}\w+", Name.Tag))
     return rules
 
 
@@ -151,7 +149,7 @@ class PyOnlyTopLexer(RegexLexer):
 class MixedAdversarialLexer(RegexLexer):
     tokens = {
         "root": [
-            (r"(?a)(@)?tag(?:\(\d+\)|:\w+)", Keyword.Pseudo),
+            (r"@?\N{LATIN SMALL LETTER T}ag(?:\(\d+\)|:\w+)", Keyword.Pseudo),
             (r"(?<!\.)\b(?:len|print|eval|exec|hash)\b(?=\s*\()", Name.Builtin),
             (r"(?<=fn )([A-Za-z_]\w*)", Name.Function),
             (r"(['\"])([^'\"\n]*)\1", bygroups(String.Delimiter, String)),
