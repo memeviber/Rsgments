@@ -1,4 +1,3 @@
-import re
 import statistics
 import sys
 import time
@@ -93,7 +92,9 @@ def make_pyonly_rules(prefix: str, count: int = 10):
     rules = []
     for i in range(count):
         if i % 3 == 0:
-            rules.append((rf"@?{escaped_first}{rest}{i}(?:\(\d+\)|:\w+)", Keyword.Reserved))
+            rules.append(
+                (rf"@?{escaped_first}{rest}{i}(?:\(\d+\)|:\w+)", Keyword.Reserved)
+            )
         elif i % 3 == 1:
             rules.append((rf"!?{escaped_first}{rest}{i}_[a-z]+\d*", Name.Decorator))
         else:

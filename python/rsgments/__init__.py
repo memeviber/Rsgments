@@ -9,11 +9,8 @@ from typing import Iterable, Iterator, List, Optional, Tuple
 from pygments.lexer import ExtendedRegexLexer, RegexLexer
 from pygments.token import Error, Text, Whitespace, _TokenType
 
-from ._rsgments import (
-    CompiledLexer,
-    CompiledLexerBuilder,  # type: ignore
-    LexProfile,
-)
+from ._rsgments import CompiledLexerBuilder  # type: ignore
+from ._rsgments import CompiledLexer, LexProfile
 
 __all__ = [
     "__version__",
@@ -35,7 +32,7 @@ __all__ = [
     "LexProfile",
 ]
 
-__version__ = "0.3.6"
+__version__ = "0.3.7"
 
 _SKIP_TOKEN = 0xFFFFFFFF
 _orig_get_tokens_unprocessed = RegexLexer.get_tokens_unprocessed
@@ -418,6 +415,7 @@ def lex_flat_byte_spans(
     compiled = compile_lexer(lexer)
     stack_arg = None if stack is None else list(stack)
     return compiled.lex_flat_byte_spans(text, lexer, stack_arg, start_byte, end_byte)
+
 
 def lex_flat_spans_profiled(
     lexer: RegexLexer,

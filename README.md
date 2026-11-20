@@ -202,11 +202,11 @@ Byte-span calls through `lex_flat_byte_spans` bypass character offset calculatio
 
 ## Ecosystem Coverage
 
-Rsgments has been tested against the full Pygments 2.19.2 lexer ecosystem, successfully compiling all 422 compatible `RegexLexer` classes.
+Rsgments has been tested against the full Pygments 2.21.0 lexer ecosystem, successfully compiling all 427 compatible `RegexLexer` classes.
 
-- **422/422 (100%)** compatible `RegexLexer` classes compile successfully with exact token-level parity.
-- **314/422 (74.4%)** run entirely in Rust without Python fallback.
-- **24,395/24,927 (97.9%)** regex rules are indexed by the native MultiDFA engine.
+- **427/427 (100%)** compatible `RegexLexer` classes compile successfully with exact token-level parity.
+- **347/427 (81.3%)** run entirely in Rust without Python fallback.
+- **22,558/25,280 (89.2%)** regex rules are indexed by the native MultiDFA engine.
 
 Unsupported lexer types, including `ExtendedRegexLexer` and custom Python-based lexers, safely fall back to the original Pygments implementation.
 

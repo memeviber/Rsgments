@@ -33,7 +33,11 @@ def assert_parity(pattern, source, *, flags=re.MULTILINE, token=Name):
     [
         # Named Unicode escapes (\N{...}) must fall back to Python instead of
         # being misparsed by fancy-regex (where \N means [^\n]).
-        (r"\N{LATIN SMALL LETTER C}af\N{LATIN SMALL LETTER E WITH ACUTE}", "café cafe", re.UNICODE),
+        (
+            r"\N{LATIN SMALL LETTER C}af\N{LATIN SMALL LETTER E WITH ACUTE}",
+            "café cafe",
+            re.UNICODE,
+        ),
         (r"[\N{DIGIT ZERO}-\N{DIGIT NINE}]+", "abc 123 def", re.UNICODE),
         # Unicode shorthand and boundary classes. Python's \w excludes combining marks;
         # Python's \s includes several separators not consistently classified by Rust.
